@@ -129,7 +129,24 @@ func (s *KeySet) resolve() []resolvedKey {
 		if err != nil {
 			continue
 		}
-		out = append(out, resolvedKey{thumbprint: tp, pub: pub, alg: alg, nbf: k.Nbf, exp: k.Exp})
+		out = append(out, resolvedKey{
+			thumbprint: tp,
+			pub:        pub,
+			alg:        alg,
+			nbf:        normalizeEpoch(k.Nbf),
+			exp:        normalizeEpoch(k.Exp),
+		})
 	}
 	return out
+}
+
+// normalizeEpoch tolerates directory timestamps published in milliseconds —
+// RFC 7517 NumericDate is seconds, but live deployments (including
+// Cloudflare Research's example directory) publish nbf in milliseconds.
+// Any value too large to be a plausible Unix-seconds timestamp is scaled.
+func normalizeEpoch(v int64) int64 {
+	if v > 1_000_000_000_000 {
+		return v / 1000
+	}
+	return v
 }

@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1" # weekly interop check against the live reference deployment
 
 permissions:
   contents: read
@@ -29,3 +32,18 @@ jobs:
         run: |
           go test -fuzz=FuzzParseDictionary -fuzztime=30s ./httpsig/
           go test -fuzz=FuzzParseSignatureInput -fuzztime=30s ./httpsig/
+
+  # Live interop against Cloudflare Research's reference deployment. Hits a
+  # third-party service, so it runs on demand and weekly, not per-push.
+  interop:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: live interop
+        env:
+          WEBBOTAUTH_INTEROP: "1"
+        run: go test -v ./interop/
