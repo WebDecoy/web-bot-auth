@@ -72,7 +72,7 @@ Publish `signer.PublicJWK()` in a JWK Set at `https://mybot.example/.well-known/
 
 ## Spec status
 
-Implements `draft-meunier-webbotauth-httpsig-protocol-00` and `draft-meunier-webbotauth-httpsig-directory-00` (June 2026), plus the earlier architecture draft's wire forms for compatibility with deployed signers. The IETF [webbotauth working group](https://datatracker.ietf.org/wg/webbotauth/documents/) is active; releases are tagged against draft revisions and this README states the pinned revision.
+Implements `draft-meunier-webbotauth-httpsig-protocol-02` (August 2026) and `draft-meunier-webbotauth-httpsig-directory-00` (June 2026), plus the earlier architecture draft's wire forms for compatibility with deployed signers. The IETF [webbotauth working group](https://datatracker.ietf.org/wg/webbotauth/documents/) is active; releases are tagged against draft revisions and this README states the pinned revision.
 
 ### Profile boundary (deliberate non-goals)
 

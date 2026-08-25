@@ -309,3 +309,58 @@ func containsError(errs []error, substr string) bool {
 	}
 	return false
 }
+
+// TestDirectoryServedAsHTMLIsRejected wires the draft-02 §5.5.1 content-type
+// gate end to end.
+//
+// The unit test on checkDirectoryContentType proves the function decides
+// correctly; it does not prove the fetch path calls it. A gate that exists and
+// is never invoked is the failure mode this repo has hit before, so the check
+// that matters is this one: a server returning perfectly valid JWKS bytes under
+// text/html must not verify.
+//
+// Before the gate, those bytes parsed, the key resolved, and the request
+// verified — so an SSO interstitial or captive portal that happened to serve
+// JSON could stand in for an operator's directory.
+func TestDirectoryServedAsHTMLIsRejected(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != webbotauth.WellKnownDirectoryPath {
+			http.NotFound(w, r)
+			return
+		}
+		// Valid key material, wrong media type. The bytes alone would parse.
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		signer, _ := webbotauth.NewSigner(priv)
+		json.NewEncoder(w).Encode(webbotauth.KeySet{Keys: []webbotauth.JWK{signer.PublicJWK()}})
+	}))
+	defer dir.Close()
+
+	dirHost := strings.Split(strings.TrimPrefix(dir.URL, "https://"), ":")[0]
+
+	signer, err := webbotauth.NewSigner(priv, webbotauth.WithSignatureAgent(dir.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound, _ := http.NewRequest("GET", "https://example.com/protected", nil)
+	if err := signer.SignRequest(outbound); err != nil {
+		t.Fatal(err)
+	}
+
+	verifier := webbotauth.NewVerifier(
+		webbotauth.WithDirectoryAllowlist(dirHost),
+		webbotauth.WithHTTPClient(dir.Client()),
+	)
+	res := verifier.Verify(context.Background(), &httpsig.Request{
+		Method: "GET", Scheme: "https", Authority: "example.com",
+		Path: "/protected", Header: outbound.Header,
+	})
+
+	if res.Status == webbotauth.StatusVerified {
+		t.Fatal("a directory served as text/html verified; the content-type gate is not wired into the fetch path")
+	}
+}
