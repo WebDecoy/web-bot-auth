@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -186,6 +187,10 @@ func (d *directoryClient) fetch(ctx context.Context, rawURL string) ([]resolvedK
 			resp.Body.Close()
 			return nil, fmt.Errorf("webbotauth: directory %q returned %d", current, resp.StatusCode)
 		}
+		if err := checkDirectoryContentType(resp.Header.Get("Content-Type")); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("webbotauth: directory %q: %w", current, err)
+		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxDirectoryBytes+1))
 		resp.Body.Close()
 		if err != nil {
@@ -200,4 +205,42 @@ func (d *directoryClient) fetch(ctx context.Context, rawURL string) ([]resolvedK
 		}
 		return set.resolve(), nil
 	}
+}
+
+// directoryContentTypes are the media types a key directory may arrive as.
+//
+// draft-meunier-webbotauth-httpsig-protocol-02 §5.5.1 requires the well-known
+// directory to be served as application/http-message-signatures-directory+json.
+// The other two are accepted because they are what this client asks for in its
+// Accept header and what deployments predating the registration actually send;
+// refusing them would fail against live directories to enforce a MUST that
+// binds the server, not us.
+var directoryContentTypes = map[string]bool{
+	"application/http-message-signatures-directory+json": true,
+	"application/jwk-set+json":                           true,
+	"application/json":                                   true,
+}
+
+// checkDirectoryContentType rejects a response that is plainly not a directory.
+//
+// Without this the client parsed whatever came back and only failed if the
+// bytes were not JSON. A captive portal, an SSO interstitial or an error page
+// that happens to be JSON would be read as a key set, and the verifier would
+// then report "no key matching keyid" — a statement about the operator's
+// directory, when the truth was that we never reached one.
+//
+// An absent Content-Type is allowed. It is a server omission rather than a
+// wrong answer, and the JWKS parse still has to succeed.
+func checkDirectoryContentType(header string) error {
+	if strings.TrimSpace(header) == "" {
+		return nil
+	}
+	mediaType, _, err := mime.ParseMediaType(header)
+	if err != nil {
+		return fmt.Errorf("unparseable Content-Type %q", header)
+	}
+	if !directoryContentTypes[strings.ToLower(mediaType)] {
+		return fmt.Errorf("Content-Type %q is not a key directory", mediaType)
+	}
+	return nil
 }
