@@ -18,13 +18,14 @@ import (
 // operating a signing bot, and for tests. The zero value is not usable;
 // construct with NewSigner.
 type Signer struct {
-	key      crypto.PrivateKey
-	alg      httpsig.Algorithm
-	keyID    string
-	agent    string // Signature-Agent URI; "" omits the header
-	label    string
-	lifetime time.Duration
-	clock    func() time.Time
+	key         crypto.PrivateKey
+	alg         httpsig.Algorithm
+	keyID       string
+	agent       string // Signature-Agent URI; "" omits the header
+	legacyAgent bool   // bare sf-string for deployed verifiers that predate dictionary form
+	label       string
+	lifetime    time.Duration
+	clock       func() time.Time
 }
 
 // SignerOption configures a Signer.
@@ -35,6 +36,15 @@ type SignerOption func(*Signer)
 // directory.
 func WithSignatureAgent(uri string) SignerOption {
 	return func(s *Signer) { s.agent = uri }
+}
+
+// WithLegacySignatureAgent emits the pre-dictionary Signature-Agent wire
+// format. The IETF WG draft requires dictionary form for new signers, so this
+// option exists only for interoperability with deployed verifiers that have
+// not migrated yet (notably Cloudflare's public verifier as of September
+// 2026). Verifiers should continue to accept both forms during migration.
+func WithLegacySignatureAgent() SignerOption {
+	return func(s *Signer) { s.legacyAgent = true }
 }
 
 // WithLabel sets the signature label (default "sig1").
@@ -142,7 +152,11 @@ func (s *Signer) SignRequest(r *http.Request) error {
 	}
 
 	if s.agent != "" {
-		r.Header.Set("Signature-Agent", s.label+"="+quoteSFString(s.agent))
+		if s.legacyAgent {
+			r.Header.Set("Signature-Agent", quoteSFString(s.agent))
+		} else {
+			r.Header.Set("Signature-Agent", s.label+"="+quoteSFString(s.agent))
+		}
 	}
 
 	nonce := make([]byte, 64)
@@ -151,9 +165,13 @@ func (s *Signer) SignRequest(r *http.Request) error {
 	}
 	now := s.clock()
 
-	components := []string{"@authority"}
+	components := []string{quoteSFString("@authority")}
 	if s.agent != "" {
-		components = append(components, "signature-agent")
+		component := quoteSFString("signature-agent")
+		if !s.legacyAgent {
+			component += ";key=" + quoteSFString(s.label)
+		}
+		components = append(components, component)
 	}
 	memberValue := buildSignatureInputMember(components, now.Unix(), now.Add(s.lifetime).Unix(), s.keyID, string(s.alg), base64.StdEncoding.EncodeToString(nonce))
 
@@ -180,12 +198,8 @@ func (s *Signer) SignRequest(r *http.Request) error {
 // buildSignatureInputMember serializes the inner list for Signature-Input,
 // with the parameter order the reference implementation emits.
 func buildSignatureInputMember(components []string, created, expires int64, keyID, alg, nonce string) string {
-	quoted := make([]string, len(components))
-	for i, c := range components {
-		quoted[i] = quoteSFString(c)
-	}
 	return fmt.Sprintf("(%s);created=%d;keyid=%s;alg=%s;expires=%d;nonce=%s;tag=%s",
-		strings.Join(quoted, " "), created, quoteSFString(keyID), quoteSFString(alg),
+		strings.Join(components, " "), created, quoteSFString(keyID), quoteSFString(alg),
 		expires, quoteSFString(nonce), quoteSFString(Tag))
 }
 

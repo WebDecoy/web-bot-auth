@@ -1,6 +1,6 @@
 // Package webbotauth verifies and produces Web Bot Auth signatures —
 // cryptographic bot identity for HTTP requests per
-// draft-meunier-webbotauth-httpsig-protocol (RFC 9421 HTTP Message
+// draft-ietf-webbotauth-httpsig-protocol (RFC 9421 HTTP Message
 // Signatures with the "web-bot-auth" tag, keyed by JWK thumbprint, with
 // keys discovered from HTTP Message Signatures directories).
 //
@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/WebDecoy/web-bot-auth/httpsig"
@@ -72,28 +73,30 @@ type Result struct {
 // Verifier verifies Web Bot Auth requests. Construct with NewVerifier; safe
 // for concurrent use.
 type Verifier struct {
-	static      []resolvedKey
-	directories *directoryClient
-	clock       func() time.Time
-	skew        time.Duration
-	maxLifetime time.Duration
-	nonceCheck  func(ctx context.Context, nonce string, r *Result) error
+	static            []resolvedKey
+	directories       *directoryClient
+	clock             func() time.Time
+	skew              time.Duration
+	maxLifetime       time.Duration
+	nonceCheck        func(ctx context.Context, nonce string, r *Result) error
+	allowMissingAgent bool
 }
 
 // Option configures a Verifier.
 type Option func(*verifierConfig)
 
 type verifierConfig struct {
-	static      []JWK
-	allowlist   []string
-	open        bool
-	httpClient  *http.Client
-	cacheTTL    time.Duration
-	staleTTL    time.Duration
-	clock       func() time.Time
-	skew        time.Duration
-	maxLifetime time.Duration
-	nonceCheck  func(ctx context.Context, nonce string, r *Result) error
+	static            []JWK
+	allowlist         []string
+	open              bool
+	httpClient        *http.Client
+	cacheTTL          time.Duration
+	staleTTL          time.Duration
+	clock             func() time.Time
+	skew              time.Duration
+	maxLifetime       time.Duration
+	nonceCheck        func(ctx context.Context, nonce string, r *Result) error
+	allowMissingAgent bool
 }
 
 // WithKeys adds static keys matched by thumbprint before any directory
@@ -154,6 +157,14 @@ func WithNonceChecker(f func(ctx context.Context, nonce string, r *Result) error
 	return func(c *verifierConfig) { c.nonceCheck = f }
 }
 
+// WithLegacyMissingSignatureAgent accepts the pre-WG-draft form where a
+// web-bot-auth signature omitted Signature-Agent entirely. Current signers
+// MUST send Signature-Agent, so this option is only for replaying historical
+// fixtures or staged migrations.
+func WithLegacyMissingSignatureAgent() Option {
+	return func(c *verifierConfig) { c.allowMissingAgent = true }
+}
+
 // NewVerifier builds a Verifier.
 func NewVerifier(opts ...Option) *Verifier {
 	cfg := verifierConfig{
@@ -167,11 +178,12 @@ func NewVerifier(opts ...Option) *Verifier {
 		opt(&cfg)
 	}
 	v := &Verifier{
-		static:      (&KeySet{Keys: cfg.static}).resolve(),
-		clock:       cfg.clock,
-		skew:        cfg.skew,
-		maxLifetime: cfg.maxLifetime,
-		nonceCheck:  cfg.nonceCheck,
+		static:            (&KeySet{Keys: cfg.static}).resolve(),
+		clock:             cfg.clock,
+		skew:              cfg.skew,
+		maxLifetime:       cfg.maxLifetime,
+		nonceCheck:        cfg.nonceCheck,
+		allowMissingAgent: cfg.allowMissingAgent,
 	}
 	v.directories = newDirectoryClient(cfg.httpClient, cfg.cacheTTL, cfg.staleTTL, cfg.allowlist, cfg.open, cfg.clock)
 	return v
@@ -306,8 +318,20 @@ func (v *Verifier) verifyCandidate(ctx context.Context, req *httpsig.Request, m 
 	if !m.CoversComponent("@authority") && !m.CoversComponent("@target-uri") {
 		return errors.New("signature covers neither @authority nor @target-uri")
 	}
-	if agentHeaderPresent && !m.CoversComponent("signature-agent") {
-		return errors.New("Signature-Agent header present but not covered by the signature")
+	if !agentHeaderPresent && !v.allowMissingAgent {
+		return errors.New("missing Signature-Agent header")
+	}
+	if agentHeaderPresent {
+		if !m.CoversComponent("signature-agent") {
+			return errors.New("Signature-Agent header present but not covered by the signature")
+		}
+		ref, ok := agentRefForSignature(m, agents)
+		if !ok {
+			return errors.New("Signature-Agent dictionary member is not covered by the signature")
+		}
+		if ref.Label != "" && !coversDictionaryMember(m, "signature-agent", ref.Label) {
+			return errors.New("Signature-Agent dictionary member is not covered by the signature")
+		}
 	}
 
 	base, err := httpsig.SignatureBase(req, m)
@@ -316,7 +340,7 @@ func (v *Verifier) verifyCandidate(ctx context.Context, req *httpsig.Request, m 
 	}
 
 	alg, _ := m.Alg()
-	key, directory, agentURI, err := v.resolveKey(ctx, keyID, m.Label, agents)
+	key, directory, agentURI, err := v.resolveKey(ctx, keyID, m, agents)
 	if err != nil {
 		return err
 	}
@@ -352,13 +376,48 @@ func (v *Verifier) verifyCandidate(ctx context.Context, req *httpsig.Request, m 
 	return nil
 }
 
-func (v *Verifier) resolveKey(ctx context.Context, keyID, label string, agents []AgentRef) (resolvedKey, string, string, error) {
+func coversDictionaryMember(m *httpsig.SignatureMember, name, key string) bool {
+	for _, component := range m.Components {
+		if !strings.EqualFold(component.Name, name) {
+			continue
+		}
+		for _, param := range component.Params {
+			value, ok := param.Value.(string)
+			if param.Key == "key" && ok && value == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func agentRefForSignature(m *httpsig.SignatureMember, agents []AgentRef) (AgentRef, bool) {
+	for _, component := range m.Components {
+		if !strings.EqualFold(component.Name, "signature-agent") {
+			continue
+		}
+		for _, param := range component.Params {
+			member, ok := param.Value.(string)
+			if param.Key == "key" && ok {
+				return refForLabel(agents, member)
+			}
+		}
+		for _, ref := range agents {
+			if ref.Label == "" {
+				return ref, true
+			}
+		}
+	}
+	return AgentRef{}, false
+}
+
+func (v *Verifier) resolveKey(ctx context.Context, keyID string, member *httpsig.SignatureMember, agents []AgentRef) (resolvedKey, string, string, error) {
 	for _, k := range v.static {
 		if k.thumbprint == keyID {
 			return k, "", "", nil
 		}
 	}
-	ref, ok := refForLabel(agents, label)
+	ref, ok := agentRefForSignature(member, agents)
 	if !ok {
 		return resolvedKey{}, "", "", errors.New("key not in static set and no Signature-Agent to resolve from")
 	}
