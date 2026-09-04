@@ -27,9 +27,10 @@ import (
 )
 
 const (
-	liveOrigin = "https://http-message-signatures-example.research.cloudflare.com"
-	liveHost   = "http-message-signatures-example.research.cloudflare.com"
-	verifyAPI  = liveOrigin + "/v0/api/verify"
+	liveOrigin         = "https://http-message-signatures-example.research.cloudflare.com"
+	liveHost           = "http-message-signatures-example.research.cloudflare.com"
+	verifyAPI          = liveOrigin + "/v0/api/verify"
+	cloudflareVerifier = "https://crawltest.com/cdn-cgi/web-bot-auth"
 
 	// The shared RFC 9421 Ed25519 test key: the live deployment trusts it,
 	// and it is the same key as the reference vectors'.
@@ -122,6 +123,30 @@ func TestLiveVerifierRejectsTamperedSignature(t *testing.T) {
 	req.Header.Set("Signature", sig[:mid]+string(c)+sig[mid+1:])
 	if _, body := fetchBody(t, req); !strings.HasPrefix(body, "invalid") {
 		t.Fatalf("tampered request: body %q, want invalid*", body)
+	}
+}
+
+// Cloudflare's production verifier still requires the pre-dictionary
+// Signature-Agent form. A 401 means the request parsed correctly but the
+// fixture key is not registered; 400 means our wire format was rejected.
+func TestCloudflareVerifierParsesLegacyInteropMode(t *testing.T) {
+	requireInterop(t)
+	signer, err := webbotauth.NewSigner(testPrivateKey(t),
+		webbotauth.WithSignatureAgent(liveOrigin),
+		webbotauth.WithLegacySignatureAgent())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, cloudflareVerifier, nil)
+	if err := signer.SignRequest(req); err != nil {
+		t.Fatal(err)
+	}
+	status, body := fetchBody(t, req)
+	if status == http.StatusBadRequest {
+		t.Fatalf("Cloudflare rejected legacy wire format: HTTP %d, body %q", status, body)
+	}
+	if status != http.StatusUnauthorized && status != http.StatusOK {
+		t.Fatalf("Cloudflare verifier: HTTP %d, body %q", status, body)
 	}
 }
 

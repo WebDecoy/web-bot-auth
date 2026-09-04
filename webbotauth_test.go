@@ -77,6 +77,7 @@ func TestVerifyReferenceVectorsStaticKeys(t *testing.T) {
 						webbotauth.WithKeys(v.Key),
 						webbotauth.WithClock(func() time.Time { return time.UnixMilli(v.CreatedMS).Add(time.Minute) }),
 						webbotauth.WithMaxLifetime(200*365*24*time.Hour),
+						webbotauth.WithLegacyMissingSignatureAgent(),
 					)
 					res := verifier.Verify(context.Background(), vectorHTTPRequest(t, &v))
 					if res.Status != webbotauth.StatusVerified {
@@ -107,7 +108,7 @@ func mustKeyID(t *testing.T, k webbotauth.JWK) (string, webbotauth.JWK) {
 func TestVerifyExpired(t *testing.T) {
 	vs := loadE2EVectors(t, "web_bot_auth_architecture_v1.json")
 	v := vs[0] // expires 2025-01-01, long past
-	verifier := webbotauth.NewVerifier(webbotauth.WithKeys(v.Key))
+	verifier := webbotauth.NewVerifier(webbotauth.WithKeys(v.Key), webbotauth.WithLegacyMissingSignatureAgent())
 	res := verifier.Verify(context.Background(), vectorHTTPRequest(t, &v))
 	if res.Status != webbotauth.StatusInvalid {
 		t.Fatalf("status = %v, want invalid", res.Status)
@@ -265,9 +266,77 @@ func TestSignatureAgentMustBeCovered(t *testing.T) {
 	}
 }
 
+func TestSignerBindsDictionarySignatureAgentMember(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(nil)
+	signer, err := webbotauth.NewSigner(priv, webbotauth.WithSignatureAgent("https://agent.example"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound, _ := http.NewRequest("GET", "https://example.com/", nil)
+	if err := signer.SignRequest(outbound); err != nil {
+		t.Fatal(err)
+	}
+	if got := outbound.Header.Get("Signature-Agent"); got != `sig1="https://agent.example"` {
+		t.Fatalf("Signature-Agent = %q", got)
+	}
+	if got := outbound.Header.Get("Signature-Input"); !strings.Contains(got, `"signature-agent";key="sig1"`) {
+		t.Fatalf("Signature-Input does not bind the sig1 dictionary member: %s", got)
+	}
+
+	inbound := &httpsig.Request{Method: "GET", Scheme: "https", Authority: "example.com", Path: "/", Header: outbound.Header}
+	res := webbotauth.NewVerifier(webbotauth.WithKeys(signer.PublicJWK())).Verify(context.Background(), inbound)
+	if res.Status != webbotauth.StatusVerified {
+		t.Fatalf("status = %v, errors = %v", res.Status, res.Errors)
+	}
+}
+
+func TestSignerLegacySignatureAgentInteropMode(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(nil)
+	signer, err := webbotauth.NewSigner(priv,
+		webbotauth.WithSignatureAgent("https://agent.example"),
+		webbotauth.WithLegacySignatureAgent())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound, _ := http.NewRequest("GET", "https://example.com/", nil)
+	if err := signer.SignRequest(outbound); err != nil {
+		t.Fatal(err)
+	}
+	if got := outbound.Header.Get("Signature-Agent"); got != `"https://agent.example"` {
+		t.Fatalf("legacy Signature-Agent = %q", got)
+	}
+	if got := outbound.Header.Get("Signature-Input"); !strings.Contains(got, `"signature-agent"`) || strings.Contains(got, `"signature-agent";key=`) {
+		t.Fatalf("legacy Signature-Input = %s", got)
+	}
+
+	inbound := &httpsig.Request{Method: "GET", Scheme: "https", Authority: "example.com", Path: "/", Header: outbound.Header}
+	res := webbotauth.NewVerifier(webbotauth.WithKeys(signer.PublicJWK())).Verify(context.Background(), inbound)
+	if res.Status != webbotauth.StatusVerified {
+		t.Fatalf("status = %v, errors = %v", res.Status, res.Errors)
+	}
+}
+
+func TestVerifierRejectsWholeDictionaryHeaderCoverage(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(nil)
+	signer, _ := webbotauth.NewSigner(priv,
+		webbotauth.WithSignatureAgent("https://agent.example"),
+		webbotauth.WithLegacySignatureAgent())
+	outbound, _ := http.NewRequest("GET", "https://example.com/", nil)
+	if err := signer.SignRequest(outbound); err != nil {
+		t.Fatal(err)
+	}
+	outbound.Header.Set("Signature-Agent", `sig1="https://agent.example"`)
+
+	inbound := &httpsig.Request{Method: "GET", Scheme: "https", Authority: "example.com", Path: "/", Header: outbound.Header}
+	res := webbotauth.NewVerifier(webbotauth.WithKeys(signer.PublicJWK())).Verify(context.Background(), inbound)
+	if res.Status != webbotauth.StatusInvalid || !containsError(res.Errors, "dictionary member") {
+		t.Fatalf("status = %v, errors = %v", res.Status, res.Errors)
+	}
+}
+
 func TestNonceChecker(t *testing.T) {
 	_, priv, _ := ed25519.GenerateKey(nil)
-	signer, _ := webbotauth.NewSigner(priv)
+	signer, _ := webbotauth.NewSigner(priv, webbotauth.WithSignatureAgent("https://agent.example"))
 	outbound, _ := http.NewRequest("GET", "https://example.com/", nil)
 	if err := signer.SignRequest(outbound); err != nil {
 		t.Fatal(err)
