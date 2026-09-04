@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -23,6 +24,7 @@ func TestFetchDirectory(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
+		w.Header().Set("Content-Type", "application/http-message-signatures-directory+json")
 		json.NewEncoder(w).Encode(webbotauth.KeySet{Keys: []webbotauth.JWK{jwk}})
 	}))
 	defer srv.Close()
@@ -62,6 +64,25 @@ func TestFetchDirectoryErrors(t *testing.T) {
 	defer srv.Close()
 	if _, err := webbotauth.FetchDirectoryWithClient(context.Background(), srv.Client(), srv.URL); err == nil || !strings.Contains(err.Error(), "500") {
 		t.Errorf("expected 500 error, got %v", err)
+	}
+}
+
+func TestFetchDirectoryRejectsRedirectAndWrongMediaType(t *testing.T) {
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/elsewhere", http.StatusFound)
+	}))
+	defer redirect.Close()
+	if _, err := webbotauth.FetchDirectoryWithClient(context.Background(), redirect.Client(), redirect.URL); err == nil || !strings.Contains(err.Error(), "302") {
+		t.Fatalf("redirect was followed or accepted: %v", err)
+	}
+
+	html := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		io.WriteString(w, `{"keys":[]}`)
+	}))
+	defer html.Close()
+	if _, err := webbotauth.FetchDirectoryWithClient(context.Background(), html.Client(), html.URL); err == nil || !strings.Contains(err.Error(), "Content-Type") {
+		t.Fatalf("wrong media type was accepted: %v", err)
 	}
 }
 
