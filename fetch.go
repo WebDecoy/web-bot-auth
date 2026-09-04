@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 )
 
 // FetchDirectory retrieves and parses the HTTP Message Signatures directory
@@ -29,27 +31,39 @@ func FetchDirectoryWithClient(ctx context.Context, hc *http.Client, origin strin
 	if hc == nil {
 		hc = http.DefaultClient
 	}
-	url := origin + WellKnownDirectoryPath
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("webbotauth: directory origin %q must be a plain http(s) origin", origin)
+	}
+	directoryURL := strings.TrimSuffix(origin, "/") + WellKnownDirectoryPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, directoryURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/http-message-signatures-directory+json, application/jwk-set+json, application/json")
 
-	resp, err := hc.Do(req)
+	// The WG draft prohibits redirects during discovery. Clone rather than
+	// mutate the caller's client, which may be shared concurrently.
+	client := *hc
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("webbotauth: fetching directory %q: %w", url, err)
+		return nil, fmt.Errorf("webbotauth: fetching directory %q: %w", directoryURL, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("webbotauth: directory %q returned HTTP %d", url, resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("webbotauth: directory %q returned HTTP %d", directoryURL, resp.StatusCode)
+	}
+	if err := checkDirectoryContentType(resp.Header.Get("Content-Type")); err != nil {
+		return nil, fmt.Errorf("webbotauth: directory %q: %w", directoryURL, err)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDirectoryBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("webbotauth: reading directory %q: %w", url, err)
+		return nil, fmt.Errorf("webbotauth: reading directory %q: %w", directoryURL, err)
 	}
 	if int64(len(body)) > maxDirectoryBytes {
-		return nil, fmt.Errorf("webbotauth: directory %q exceeds %d bytes", url, maxDirectoryBytes)
+		return nil, fmt.Errorf("webbotauth: directory %q exceeds %d bytes", directoryURL, maxDirectoryBytes)
 	}
 	return ParseKeySet(body)
 }
