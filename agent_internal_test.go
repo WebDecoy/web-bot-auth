@@ -141,3 +141,36 @@ func TestAgentIdentifier(t *testing.T) {
 		}
 	}
 }
+
+// The resolution vectors are shared with the TypeScript ports, so this test
+// is what keeps them honest.
+func TestResolveSignatureAgentVectors(t *testing.T) {
+	data, err := os.ReadFile("testdata/signature_agent_resolution.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		Valid []struct {
+			Value, Fetch, Identifier string
+		} `json:"valid"`
+		Invalid []string `json:"invalid"`
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range v.Valid {
+		fetch, id, err := ResolveSignatureAgent(c.Value)
+		if err != nil {
+			t.Errorf("%q: %v", c.Value, err)
+			continue
+		}
+		if fetch != c.Fetch || id != c.Identifier {
+			t.Errorf("%q = (%q, %q), want (%q, %q)", c.Value, fetch, id, c.Fetch, c.Identifier)
+		}
+	}
+	for _, in := range v.Invalid {
+		if _, _, err := ResolveSignatureAgent(in); err == nil {
+			t.Errorf("%q: expected an error", in)
+		}
+	}
+}
