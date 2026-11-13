@@ -60,9 +60,13 @@ type Result struct {
 	Algorithm httpsig.Algorithm // algorithm that verified
 	Agent     string            // Signature-Agent URI for the verified label, if any
 	Directory string            // URL keys were resolved from ("" when static keys matched)
-	Created   time.Time
-	Expires   time.Time
-	Nonce     string
+	// Identifier is the draft-01 identity of the verified agent: Directory
+	// with the query dropped and normalized (see AgentIdentifier). "" when
+	// static keys matched.
+	Identifier string
+	Created    time.Time
+	Expires    time.Time
+	Nonce      string
 
 	// Diagnostics. Signatures counts Web Bot Auth candidates seen; Errors
 	// collects per-candidate failures when Status is StatusInvalid.
@@ -364,6 +368,13 @@ func (v *Verifier) verifyCandidate(ctx context.Context, req *httpsig.Request, m 
 	res.Algorithm = key.alg
 	res.Agent = agentURI
 	res.Directory = directory
+	if directory != "" {
+		id, err := AgentIdentifier(directory)
+		if err != nil {
+			return fmt.Errorf("directory URL %q: %w", directory, err)
+		}
+		res.Identifier = id
+	}
 	res.Created = time.Unix(created, 0)
 	res.Expires = time.Unix(expires, 0)
 	res.Nonce = nonce

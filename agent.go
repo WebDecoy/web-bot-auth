@@ -8,35 +8,25 @@ import (
 	"github.com/WebDecoy/web-bot-auth/httpsig"
 )
 
-// AgentRefType is the discovery mechanism a Signature-Agent member declares.
-type AgentRefType string
-
-const (
-	// AgentRefDirectory resolves keys at the agent origin's well-known
-	// HTTP Message Signatures directory. This is the default.
-	AgentRefDirectory AgentRefType = "directory"
-	// AgentRefJWKSURI points directly at a JWK Set URL.
-	AgentRefJWKSURI AgentRefType = "jwks_uri"
-	// AgentRefCIMD points at a Client ID Metadata Document. Recognized but
-	// not resolved by this package.
-	AgentRefCIMD AgentRefType = "cimd"
-)
-
 // AgentRef is one parsed Signature-Agent entry.
 type AgentRef struct {
 	Label string // signature label this entry applies to; "" = any (legacy form)
-	URI   string
-	Type  AgentRefType
+	URI   string // the member value exactly as sent
 }
 
 // WellKnownDirectoryPath is where an agent origin publishes its key set.
 const WellKnownDirectoryPath = "/.well-known/http-message-signatures-directory"
 
-// parseSignatureAgent parses the Signature-Agent header. The current draft
-// form is a structured-field dictionary keyed by signature label with an
-// optional type parameter; the earlier architecture draft used a bare
-// sf-string that applies to any signature, which deployed signers still
-// send, so both forms are accepted.
+// parseSignatureAgent parses the Signature-Agent header.
+//
+// draft-ietf-webbotauth-httpsig-protocol-01 §5.2.1: the header is a
+// dictionary keyed by signature label whose values are https URIs, members
+// MUST NOT carry parameters, and a verifier MUST ignore a member that does.
+// (Draft 00 used a type parameter to pick directory, jwks_uri or cimd
+// resolution; 01 removed it, so a typed member is now simply ignored.)
+//
+// The bare sf-string form from earlier drafts is still accepted, as §5.2.1
+// allows, because deployed signers still send it.
 func parseSignatureAgent(values []string) ([]AgentRef, error) {
 	joined := strings.Join(values, ", ")
 	if trimmed := strings.TrimSpace(joined); strings.HasPrefix(trimmed, `"`) {
@@ -45,7 +35,7 @@ func parseSignatureAgent(values []string) ([]AgentRef, error) {
 		if err != nil {
 			return nil, err
 		}
-		return []AgentRef{{URI: uri, Type: AgentRefDirectory}}, nil
+		return []AgentRef{{URI: uri}}, nil
 	}
 	members, err := httpsig.ParseDictionaryHeader(joined)
 	if err != nil {
@@ -53,20 +43,14 @@ func parseSignatureAgent(values []string) ([]AgentRef, error) {
 	}
 	refs := make([]AgentRef, 0, len(members))
 	for _, m := range members {
+		if m.HasParams() {
+			continue
+		}
 		uri, ok := m.StringValue()
 		if !ok {
 			return nil, fmt.Errorf("webbotauth: Signature-Agent member %q is not a string", m.Key)
 		}
-		ref := AgentRef{Label: m.Key, URI: uri, Type: AgentRefDirectory}
-		if t, ok := m.Param("type"); ok {
-			switch AgentRefType(t) {
-			case AgentRefDirectory, AgentRefJWKSURI, AgentRefCIMD:
-				ref.Type = AgentRefType(t)
-			default:
-				return nil, fmt.Errorf("webbotauth: unknown Signature-Agent type %q", t)
-			}
-		}
-		refs = append(refs, ref)
+		refs = append(refs, AgentRef{Label: m.Key, URI: uri})
 	}
 	return refs, nil
 }
@@ -115,24 +99,72 @@ func refForLabel(refs []AgentRef, label string) (AgentRef, bool) {
 	return AgentRef{}, false
 }
 
-// keySetURL derives the URL to fetch keys from for a Signature-Agent entry.
+// keySetURL is the URL to fetch keys from for a Signature-Agent entry.
+//
+// Under draft 01 §5.5 the member value is fetched directly as a JWK Set.
+// A bare origin (no path, or "/") is the form deployed signers sent under
+// earlier drafts, where it meant "my well-known directory"; fetching the
+// origin itself would return a web page, so that one shape still resolves
+// to the well-known path. Every other URL is fetched exactly as sent.
 func (r AgentRef) keySetURL() (string, error) {
 	u, err := url.Parse(r.URI)
 	if err != nil {
 		return "", fmt.Errorf("webbotauth: invalid Signature-Agent URI %q: %w", r.URI, err)
 	}
-	if u.Scheme != "https" {
+	if !strings.EqualFold(u.Scheme, "https") {
 		return "", fmt.Errorf("webbotauth: Signature-Agent URI %q is not https", r.URI)
 	}
-	if u.Host == "" {
+	if u.Host == "" || u.Opaque != "" {
 		return "", fmt.Errorf("webbotauth: Signature-Agent URI %q has no host", r.URI)
 	}
-	switch r.Type {
-	case AgentRefDirectory:
-		return "https://" + u.Host + WellKnownDirectoryPath, nil
-	case AgentRefJWKSURI:
-		return u.String(), nil
-	default:
-		return "", fmt.Errorf("webbotauth: Signature-Agent type %q is not resolvable", r.Type)
+	if u.User != nil {
+		return "", fmt.Errorf("webbotauth: Signature-Agent URI %q carries credentials", r.URI)
 	}
+	u.Fragment, u.RawFragment = "", ""
+	if (u.Path == "" || u.Path == "/") && u.RawQuery == "" && !u.ForceQuery {
+		return "https://" + u.Host + WellKnownDirectoryPath, nil
+	}
+	return u.String(), nil
+}
+
+// AgentIdentifier is the identifier draft 01 assigns to a resolved key set:
+// the URL the verifier fetched, query discarded (§5.5), normalized per
+// RFC 3986 §6.2.2 and §6.2.3 so that spellings of one URL compare equal.
+func AgentIdentifier(fetched string) (string, error) {
+	u, err := url.Parse(fetched)
+	if err != nil {
+		return "", err
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	if u.Scheme == "https" {
+		u.Host = strings.TrimSuffix(u.Host, ":443")
+	}
+	u.RawQuery, u.ForceQuery = "", false
+	u.Fragment, u.RawFragment = "", ""
+	if u.Path == "" {
+		u.Path, u.RawPath = "/", ""
+	}
+	// Remove dot segments without touching the escaping.
+	u = u.ResolveReference(&url.URL{})
+	u.RawPath = upperPercentHex(u.EscapedPath())
+	return u.String(), nil
+}
+
+func upperPercentHex(p string) string {
+	b := []byte(p)
+	for i := 0; i+2 < len(b); i++ {
+		if b[i] == '%' {
+			b[i+1] = toUpperHex(b[i+1])
+			b[i+2] = toUpperHex(b[i+2])
+		}
+	}
+	return string(b)
+}
+
+func toUpperHex(c byte) byte {
+	if c >= 'a' && c <= 'f' {
+		return c - 'a' + 'A'
+	}
+	return c
 }

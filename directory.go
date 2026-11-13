@@ -17,14 +17,13 @@ import (
 // Key directories are fetched from URLs supplied by the *request under
 // verification*, so the client treats every fetch as an SSRF vector: https
 // only, an optional host allowlist, a guarded dialer that refuses non-global
-// addresses, capped response size, and re-validation on every redirect hop.
+// addresses, capped response size, and no redirects.
 
 const (
 	defaultCacheTTL     = 1 * time.Hour
 	defaultStaleTTL     = 24 * time.Hour
 	defaultFetchTimeout = 10 * time.Second
 	maxDirectoryBytes   = 1 << 20 // 1 MiB
-	maxRedirects        = 3
 )
 
 type directoryClient struct {
@@ -148,16 +147,17 @@ func (d *directoryClient) keys(ctx context.Context, rawURL string) ([]resolvedKe
 
 func (d *directoryClient) fetch(ctx context.Context, rawURL string) ([]resolvedKey, error) {
 	current := rawURL
-	for hop := 0; ; hop++ {
+	{
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, current, nil)
 		if err != nil {
 			return nil, fmt.Errorf("webbotauth: directory request: %w", err)
 		}
 		req.Header.Set("Accept", "application/http-message-signatures-directory+json, application/jwk-set+json, application/json")
 
-		// Redirects are followed manually so each hop re-passes the policy
-		// check; a compliant allowlisted host must not be able to bounce the
-		// verifier to an arbitrary URL.
+		// Draft 01 §5.5: anything but 200 is a discovery failure, and a
+		// verifier MUST NOT follow redirects. The fetched URL is the agent's
+		// identifier, so following one would attribute keys to a URL the
+		// agent never named.
 		hc := *d.hc
 		hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
@@ -166,22 +166,8 @@ func (d *directoryClient) fetch(ctx context.Context, rawURL string) ([]resolvedK
 			return nil, fmt.Errorf("webbotauth: directory fetch %q: %w", current, err)
 		}
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-			loc := resp.Header.Get("Location")
-			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			if hop >= maxRedirects {
-				return nil, fmt.Errorf("webbotauth: too many directory redirects from %q", rawURL)
-			}
-			next, err := url.Parse(loc)
-			if err != nil {
-				return nil, fmt.Errorf("webbotauth: invalid directory redirect: %w", err)
-			}
-			base, _ := url.Parse(current)
-			current = base.ResolveReference(next).String()
-			if err := d.permitted(current); err != nil {
-				return nil, err
-			}
-			continue
+			return nil, fmt.Errorf("webbotauth: directory %q redirected (%d); redirects are not followed", current, resp.StatusCode)
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()

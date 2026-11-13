@@ -55,3 +55,8 @@ func (m *DictionaryMember) Param(key string) (string, bool) {
 	}
 	return "", false
 }
+
+// HasParams reports whether the member carries any parameters.
+func (m *DictionaryMember) HasParams() bool {
+	return len(m.params) > 0
+}
