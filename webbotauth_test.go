@@ -65,7 +65,7 @@ func vectorHTTPRequest(t *testing.T, v *e2eVector) *httpsig.Request {
 // The clock is pinned inside each vector's validity window; v1 vectors are
 // expired in real time, which doubles as the expiry test below.
 func TestVerifyReferenceVectorsStaticKeys(t *testing.T) {
-	for _, file := range []string{"web_bot_auth_architecture_v1.json", "web_bot_auth_architecture_v2.json"} {
+	for _, file := range []string{"web_bot_auth_architecture_v1.json", "web_bot_auth_architecture_v2.json", "web_bot_auth_protocol_01.json"} {
 		t.Run(file, func(t *testing.T) {
 			for _, v := range loadE2EVectors(t, file) {
 				v := v
@@ -212,6 +212,9 @@ func TestSignerVerifierDirectoryRoundTrip(t *testing.T) {
 	if res.Directory == "" || res.Algorithm != httpsig.AlgEd25519 {
 		t.Errorf("unexpected result: %+v", res)
 	}
+	if want := dir.URL + webbotauth.WellKnownDirectoryPath; res.Identifier != want {
+		t.Errorf("identifier = %q, want %q (an origin resolves to its well-known URL)", res.Identifier, want)
+	}
 
 	// Same request, allowlist without the directory host → invalid, and the
 	// error names the policy.
@@ -240,6 +243,116 @@ func TestSignerVerifierDirectoryRoundTrip(t *testing.T) {
 	inbound.Authority = "evil.example"
 	if res = verifier.Verify(context.Background(), inbound); res.Status != webbotauth.StatusInvalid {
 		t.Fatalf("authority tamper: status = %v", res.Status)
+	}
+}
+
+// Draft 01 §5.5: a Signature-Agent value that is not a bare origin is a JWK
+// Set URL, fetched exactly as sent. The identifier is that URL without its
+// query, so two agents on one host stay distinct (§6.5) and re-spelling the
+// query does not mint a new identity.
+func TestDirectJWKSetURL(t *testing.T) {
+	_, crawlerKey, _ := ed25519.GenerateKey(nil)
+	_, userKey, _ := ed25519.GenerateKey(nil)
+	jwks := func(k ed25519.PrivateKey) webbotauth.KeySet {
+		s, _ := webbotauth.NewSigner(k)
+		return webbotauth.KeySet{Keys: []webbotauth.JWK{s.PublicJWK()}}
+	}
+	var fetched []string
+	dir := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetched = append(fetched, r.URL.RequestURI())
+		var set webbotauth.KeySet
+		switch r.URL.Path {
+		case "/agents/crawler/jwks.json":
+			set = jwks(crawlerKey)
+		case "/agents/user/jwks.json":
+			set = jwks(userKey)
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/jwk-set+json")
+		json.NewEncoder(w).Encode(set)
+	}))
+	defer dir.Close()
+	host := strings.Split(strings.TrimPrefix(dir.URL, "https://"), ":")[0]
+	verifier := webbotauth.NewVerifier(
+		webbotauth.WithDirectoryAllowlist(host),
+		webbotauth.WithHTTPClient(dir.Client()),
+	)
+	verify := func(key ed25519.PrivateKey, agent string) *webbotauth.Result {
+		t.Helper()
+		signer, err := webbotauth.NewSigner(key, webbotauth.WithSignatureAgent(agent))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _ := http.NewRequest("GET", "https://example.com/", nil)
+		if err := signer.SignRequest(out); err != nil {
+			t.Fatal(err)
+		}
+		return verifier.Verify(context.Background(), &httpsig.Request{
+			Method: "GET", Scheme: "https", Authority: "example.com", Path: "/", Header: out.Header,
+		})
+	}
+
+	crawlerURL := dir.URL + "/agents/crawler/jwks.json?rev=3"
+	res := verify(crawlerKey, crawlerURL)
+	if res.Status != webbotauth.StatusVerified {
+		t.Fatalf("crawler: status = %v, errors = %v", res.Status, res.Errors)
+	}
+	if res.Directory != crawlerURL {
+		t.Errorf("directory = %q, want the URL as sent %q", res.Directory, crawlerURL)
+	}
+	if want := dir.URL + "/agents/crawler/jwks.json"; res.Identifier != want {
+		t.Errorf("identifier = %q, want %q", res.Identifier, want)
+	}
+	if fetched[0] != "/agents/crawler/jwks.json?rev=3" {
+		t.Errorf("fetched %q, want the member value with its query", fetched[0])
+	}
+
+	user := verify(userKey, dir.URL+"/agents/user/jwks.json")
+	if user.Status != webbotauth.StatusVerified {
+		t.Fatalf("user agent: status = %v, errors = %v", user.Status, user.Errors)
+	}
+	if user.Identifier == res.Identifier {
+		t.Errorf("crawler and user agent share identifier %q", user.Identifier)
+	}
+
+	// A key published at one URL does not verify for another on the same host.
+	if cross := verify(userKey, crawlerURL); cross.Status != webbotauth.StatusInvalid {
+		t.Errorf("cross-URL key: status = %v, want invalid", cross.Status)
+	}
+}
+
+// Draft 01 §5.5: a redirect is a discovery failure, even to a URL that
+// serves the right key.
+func TestDirectoryRedirectIsNotFollowed(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(nil)
+	signer, _ := webbotauth.NewSigner(priv)
+	dir := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/moved.json" {
+			w.Header().Set("Content-Type", "application/jwk-set+json")
+			json.NewEncoder(w).Encode(webbotauth.KeySet{Keys: []webbotauth.JWK{signer.PublicJWK()}})
+			return
+		}
+		http.Redirect(w, r, "/moved.json", http.StatusFound)
+	}))
+	defer dir.Close()
+	host := strings.Split(strings.TrimPrefix(dir.URL, "https://"), ":")[0]
+
+	s, _ := webbotauth.NewSigner(priv, webbotauth.WithSignatureAgent(dir.URL+"/keys.json"))
+	out, _ := http.NewRequest("GET", "https://example.com/", nil)
+	if err := s.SignRequest(out); err != nil {
+		t.Fatal(err)
+	}
+	res := webbotauth.NewVerifier(
+		webbotauth.WithDirectoryAllowlist(host),
+		webbotauth.WithHTTPClient(dir.Client()),
+	).Verify(context.Background(), &httpsig.Request{Method: "GET", Scheme: "https", Authority: "example.com", Path: "/", Header: out.Header})
+	if res.Status == webbotauth.StatusVerified {
+		t.Fatal("verified through a redirect")
+	}
+	if !containsError(res.Errors, "redirect") {
+		t.Errorf("expected a redirect error, got %v", res.Errors)
 	}
 }
 

@@ -6,8 +6,10 @@ import (
 	"testing"
 )
 
-// Signature-Agent parsing vectors are copied verbatim from
-// cloudflare/web-bot-auth (packages/web-bot-auth).
+// The parsing vectors are copied verbatim from cloudflare/web-bot-auth
+// (packages/web-bot-auth). They were written for draft 00, where a type
+// parameter chose the resolution mechanism. Draft 01 §5.2.1 says a member
+// with parameters MUST be ignored, so only the untyped member survives.
 func TestParseSignatureAgentVectors(t *testing.T) {
 	data, err := os.ReadFile("testdata/web_bot_auth_signature_agent_v1.json")
 	if err != nil {
@@ -34,16 +36,31 @@ func TestParseSignatureAgentVectors(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(refs) != len(v.Entries) {
-				t.Fatalf("got %d entries, want %d", len(refs), len(v.Entries))
+			var want []AgentRef
+			for _, e := range v.Entries {
+				if e.Type == "directory" { // the draft-00 default: no parameter on the wire
+					want = append(want, AgentRef{Label: e.Label, URI: e.URI})
+				}
 			}
-			for i, want := range v.Entries {
-				got := refs[i]
-				if got.Label != want.Label || got.URI != want.URI || string(got.Type) != want.Type {
-					t.Errorf("entry %d = %+v, want %+v", i, got, want)
+			if len(refs) != len(want) {
+				t.Fatalf("got %+v, want %+v", refs, want)
+			}
+			for i := range want {
+				if refs[i] != want[i] {
+					t.Errorf("entry %d = %+v, want %+v", i, refs[i], want[i])
 				}
 			}
 		})
+	}
+}
+
+func TestParseSignatureAgentIgnoresParameterizedMembers(t *testing.T) {
+	refs, err := parseSignatureAgent([]string{`a="https://a.example/keys";type=jwks_uri, b="https://b.example", c="https://c.example";x=1`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || refs[0] != (AgentRef{Label: "b", URI: "https://b.example"}) {
+		t.Errorf("refs = %+v, want only member b", refs)
 	}
 }
 
@@ -52,37 +69,75 @@ func TestParseSignatureAgentLegacyString(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(refs) != 1 || refs[0].Label != "" || refs[0].URI != "https://signature-agent.test" || refs[0].Type != AgentRefDirectory {
+	if len(refs) != 1 || refs[0] != (AgentRef{URI: "https://signature-agent.test"}) {
 		t.Errorf("unexpected refs: %+v", refs)
 	}
 }
 
 func TestKeySetURL(t *testing.T) {
+	const wk = "https://agent.example/.well-known/http-message-signatures-directory"
 	cases := []struct {
-		ref  AgentRef
+		uri  string
 		want string
 		err  bool
 	}{
-		{AgentRef{URI: "https://agent.example", Type: AgentRefDirectory}, "https://agent.example/.well-known/http-message-signatures-directory", false},
-		{AgentRef{URI: "https://agent.example/some/path", Type: AgentRefDirectory}, "https://agent.example/.well-known/http-message-signatures-directory", false},
-		{AgentRef{URI: "https://agent.example/jwks.json", Type: AgentRefJWKSURI}, "https://agent.example/jwks.json", false},
-		{AgentRef{URI: "http://agent.example", Type: AgentRefDirectory}, "", true},
-		{AgentRef{URI: "https://agent.example/card", Type: AgentRefCIMD}, "", true},
+		// Legacy origin form: the well-known directory.
+		{"https://agent.example", wk, false},
+		{"https://agent.example/", wk, false},
+		// Draft 01: everything else is fetched as sent.
+		{"https://agent.example/.well-known/http-message-signatures-directory", wk, false},
+		{"https://agent.example/jwks.json", "https://agent.example/jwks.json", false},
+		{"https://agent.example/some/path", "https://agent.example/some/path", false},
+		{"https://agent.example/keys?v=2", "https://agent.example/keys?v=2", false},
+		{"https://agent.example/?v=2", "https://agent.example/?v=2", false},
+		{"https://agent.example/keys#frag", "https://agent.example/keys", false},
+		{"HTTPS://agent.example/keys", "https://agent.example/keys", false},
+		{"http://agent.example", "", true},
+		{"https:///keys", "", true},
+		{"https://user:pw@agent.example/keys", "", true},
+		{"agent.example", "", true},
 	}
 	for _, c := range cases {
-		got, err := c.ref.keySetURL()
+		got, err := AgentRef{URI: c.uri}.keySetURL()
 		if c.err {
 			if err == nil {
-				t.Errorf("keySetURL(%+v): expected error, got %q", c.ref, got)
+				t.Errorf("keySetURL(%q): expected error, got %q", c.uri, got)
 			}
 			continue
 		}
 		if err != nil {
-			t.Errorf("keySetURL(%+v): %v", c.ref, err)
+			t.Errorf("keySetURL(%q): %v", c.uri, err)
 			continue
 		}
 		if got != c.want {
-			t.Errorf("keySetURL(%+v) = %q, want %q", c.ref, got, c.want)
+			t.Errorf("keySetURL(%q) = %q, want %q", c.uri, got, c.want)
+		}
+	}
+}
+
+func TestAgentIdentifier(t *testing.T) {
+	cases := map[string]string{
+		"https://agent.example/keys":                "https://agent.example/keys",
+		"https://agent.example/keys?v=1":            "https://agent.example/keys",
+		"https://agent.example/keys?v=2":            "https://agent.example/keys",
+		"HTTPS://Agent.Example:443/keys":            "https://agent.example/keys",
+		"https://agent.example:8443/keys":           "https://agent.example:8443/keys",
+		"https://agent.example":                     "https://agent.example/",
+		"https://agent.example/a/../keys":           "https://agent.example/keys",
+		"https://agent.example/./keys":              "https://agent.example/keys",
+		"https://agent.example/k%c3%a9ys":           "https://agent.example/k%C3%A9ys",
+		"https://agent.example/keys#x":              "https://agent.example/keys",
+		"https://agent.example/keys/":               "https://agent.example/keys/",
+		"https://agent.example/.well-known/x?cache": "https://agent.example/.well-known/x",
+	}
+	for in, want := range cases {
+		got, err := AgentIdentifier(in)
+		if err != nil {
+			t.Errorf("AgentIdentifier(%q): %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("AgentIdentifier(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

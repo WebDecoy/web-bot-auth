@@ -9,9 +9,9 @@ Web Bot Auth replaces spoofable user-agent strings with cryptographic proof: age
 Built and maintained by [WebDecoy](https://webdecoy.com). Ported from and cross-validated against [`cloudflare/web-bot-auth`](https://github.com/cloudflare/web-bot-auth) — the reference implementation's test vectors run in this repo's CI.
 
 - **Zero dependencies** — `crypto/ed25519`, `crypto/rsa`, and the standard library only.
-- **Both draft generations** — the current `Signature-Agent` dictionary form with `key="..."` member extraction, and the earlier bare-string form deployed signers still send.
+- **Draft 01 discovery** — each `Signature-Agent` member is a JWK Set URL fetched as sent, members with parameters are ignored, and `Result.Identifier` is the fetched URL without its query. A bare origin (the form deployed signers still send) resolves to its well-known directory, and the legacy bare-string header form is still accepted.
 - **Verification is a verdict, not an error** — `no-signature` / `verified` / `invalid`, designed for detection pipelines where an *invalid* claim of agent identity is the most interesting outcome.
-- **SSRF-guarded key discovery** — https-only, host allowlist (or explicit open mode with a non-global-address dialer), size caps, per-hop redirect re-validation, TTL + stale-while-revalidate caching.
+- **SSRF-guarded key discovery** — https-only, host allowlist (or explicit open mode with a non-global-address dialer), size caps, no redirects, TTL + stale-while-revalidate caching.
 
 ## Install
 
@@ -76,11 +76,10 @@ requires the earlier bare-string form, add `webbotauth.WithLegacySignatureAgent(
 
 ## Spec status
 
-Implements `draft-ietf-webbotauth-httpsig-protocol-00` (September 2026), the
-working-group adoption of `draft-meunier-webbotauth-httpsig-protocol-02`, plus
-the earlier bare-string `Signature-Agent` form for compatibility with deployed
-verifiers. Releases are tagged against draft revisions and this README states
-the pinned revision.
+Implements `draft-ietf-webbotauth-httpsig-protocol-01` (October 2026), plus
+the earlier bare-string `Signature-Agent` form and bare-origin values for
+compatibility with deployed signers. Releases are tagged against draft
+revisions and this README states the pinned revision.
 
 ### Profile boundary (deliberate non-goals)
 
@@ -88,7 +87,7 @@ This is a Web Bot Auth implementation, not a general RFC 9421 library: no respon
 
 ## Security model
 
-- Directory URLs come from the *request under verification* — they are attacker-controlled input. The default fetch client is https-only, refuses loopback/private/link-local addresses in open mode, caps responses at 1 MiB, and re-checks policy on every redirect hop. Supplying your own `http.Client` transfers that responsibility to you.
+- Directory URLs come from the *request under verification* — they are attacker-controlled input. The default fetch client is https-only, refuses loopback/private/link-local addresses in open mode, caps responses at 1 MiB, and does not follow redirects (draft 01 §5.5). Supplying your own `http.Client` transfers that responsibility to you.
 - Verification failures never panic and never error out of `Verify`; malformed input from the network is a classification, not an exception. Both parsers are fuzzed in CI.
 - Replay defense is delegated: signatures carry nonces, and `WithNonceChecker` hands enforcement to your store (memory, Redis, ...). The default accepts any nonce within the signature's validity window, per the draft's baseline.
 
