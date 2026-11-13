@@ -127,6 +127,22 @@ func (r AgentRef) keySetURL() (string, error) {
 	return u.String(), nil
 }
 
+// ResolveSignatureAgent maps one Signature-Agent member value to the URL a
+// verifier fetches and the identifier draft 01 assigns it. It is the single
+// definition other implementations (edge and SDK ports) test against; see
+// testdata/signature_agent_resolution.json.
+func ResolveSignatureAgent(value string) (fetch, identifier string, err error) {
+	fetch, err = AgentRef{URI: value}.keySetURL()
+	if err != nil {
+		return "", "", err
+	}
+	identifier, err = AgentIdentifier(fetch)
+	if err != nil {
+		return "", "", err
+	}
+	return fetch, identifier, nil
+}
+
 // AgentIdentifier is the identifier draft 01 assigns to a resolved key set:
 // the URL the verifier fetched, query discarded (§5.5), normalized per
 // RFC 3986 §6.2.2 and §6.2.3 so that spellings of one URL compare equal.
